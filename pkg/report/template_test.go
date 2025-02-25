@@ -2,15 +2,17 @@ package report_test
 
 import (
 	"bytes"
-	"io/ioutil"
-	"os"
+	"context"
 	"testing"
 	"time"
 
+	"github.com/package-url/packageurl-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	dbTypes "github.com/aquasecurity/trivy-db/pkg/types"
+	"github.com/aquasecurity/trivy/pkg/clock"
+	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
 	"github.com/aquasecurity/trivy/pkg/report"
 	"github.com/aquasecurity/trivy/pkg/types"
 )
@@ -30,13 +32,17 @@ func TestReportWriter_Template(t *testing.T) {
 					PkgName:         "foo",
 					Vulnerability: dbTypes.Vulnerability{
 						Severity: dbTypes.SeverityHigh.String(),
+						VendorSeverity: map[dbTypes.SourceID]dbTypes.Severity{
+							"nvd": 1,
+						},
 					},
 				},
 				{
 					VulnerabilityID: "CVE-2019-0000",
 					PkgName:         "bar",
 					Vulnerability: dbTypes.Vulnerability{
-						Severity: dbTypes.SeverityHigh.String()},
+						Severity: dbTypes.SeverityHigh.String(),
+					},
 				},
 				{
 					VulnerabilityID: "CVE-2019-0001",
@@ -153,21 +159,47 @@ func TestReportWriter_Template(t *testing.T) {
 			expected: `Critical: 2, High: 1`,
 		},
 		{
-			name:          "happy path: env var parsing and getCurrentTime",
+			name: "custom JSON marshaler",
+			detectedVulns: []types.DetectedVulnerability{
+				{
+					VulnerabilityID: "CVE-2019-0000",
+					PkgName:         "foo",
+					Status:          dbTypes.StatusAffected,
+					PkgIdentifier: ftypes.PkgIdentifier{
+						PURL: &packageurl.PackageURL{
+							Type:    packageurl.TypeNPM,
+							Name:    "foobar",
+							Version: "1.2.3",
+						},
+					},
+				},
+			},
+			template: `{{ range . }}{{ range .Vulnerabilities}}{{ toPrettyJson . }}{{ end }}{{ end }}`,
+			expected: `{
+  "VulnerabilityID": "CVE-2019-0000",
+  "PkgName": "foo",
+  "PkgIdentifier": {
+    "PURL": "pkg:npm/foobar@1.2.3"
+  },
+  "Status": "affected",
+  "Layer": {}
+}`,
+		},
+		{
+			name:          "happy path: env var parsing",
 			detectedVulns: []types.DetectedVulnerability{},
-			template:      `{{ toLower (getEnv "AWS_ACCOUNT_ID") }} {{ getCurrentTime }}`,
-			expected:      `123456789012 2020-08-10T07:28:17.000958601Z`,
+			template:      `{{ lower (env "AWS_ACCOUNT_ID") }}`,
+			expected:      `123456789012`,
 		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			report.Now = func() time.Time {
-				return time.Date(2020, 8, 10, 7, 28, 17, 958601, time.UTC)
-			}
-			os.Setenv("AWS_ACCOUNT_ID", "123456789012")
-			tmplWritten := bytes.Buffer{}
-			inputReport := report.Report{
-				Results: report.Results{
+			ctx := clock.With(context.Background(), time.Date(2020, 8, 10, 7, 28, 17, 958601, time.UTC))
+
+			t.Setenv("AWS_ACCOUNT_ID", "123456789012")
+			got := bytes.Buffer{}
+			inputReport := types.Report{
+				Results: types.Results{
 					{
 						Target:          "foojunit",
 						Type:            "test",
@@ -176,40 +208,11 @@ func TestReportWriter_Template(t *testing.T) {
 				},
 			}
 
-			assert.NoError(t, report.Write("template", &tmplWritten, nil, inputReport, tc.template, false))
-			assert.Equal(t, tc.expected, tmplWritten.String())
-		})
-	}
-}
-
-func TestReportWriter_Template_SARIF(t *testing.T) {
-	testCases := []struct {
-		name          string
-		target        string
-		detectedVulns []types.DetectedVulnerability
-		want          string
-	}{
-		//TODO: refactor tests
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			templateFile := "../../contrib/sarif.tpl"
-			got := bytes.Buffer{}
-
-			template, err := ioutil.ReadFile(templateFile)
-			require.NoError(t, err, tc.name)
-
-			inputReport := report.Report{
-				Results: report.Results{
-					{
-						Target:          tc.target,
-						Type:            "footype",
-						Vulnerabilities: tc.detectedVulns,
-					},
-				},
-			}
-			assert.NoError(t, report.Write("template", &got, nil, inputReport, string(template), false), tc.name)
-			assert.JSONEq(t, tc.want, got.String(), tc.name)
+			w, err := report.NewTemplateWriter(&got, tc.template, "dev")
+			require.NoError(t, err)
+			err = w.Write(ctx, inputReport)
+			require.NoError(t, err)
+			assert.Equal(t, tc.expected, got.String())
 		})
 	}
 }
